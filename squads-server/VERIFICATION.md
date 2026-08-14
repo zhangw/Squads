@@ -28,3 +28,20 @@ Verify time: 2026-08-14T17:53Z ~ 17:58Z (local machine time)
 - GET /api/v1/* with wrong token -> 401
 - POST to non-allowlisted group -> 403 "group is not in the send allowlist" (nothing sent)
 - POST to non-member contact -> 403 "contact is not a member of an allowlisted group" (nothing sent)
+
+## Round 2 additions
+
+- squads-cli reference client (all read commands verified live against the server; send commands share the verified REST path).
+- 5 unit tests pass (cargo test): html_escape, ct_eq, parse_dir, build_message_payload, allowlist config.
+- devel_vincent pushed to origin (https://github.com/zhangw/Squads/tree/devel_vincent).
+
+CLI verification (live):
+
+```
+CLI groups count: 110
+CLI group-info: low latency engine devops | members: 10
+CLI group-msgs: 200 messages
+CLI contacts: 300
+CLI contact-info: Yuxiao Yuan | yuxiao.yuan@webull-us.com
+CLI contact-msgs: 200 messages
+```
