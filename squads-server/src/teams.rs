@@ -38,12 +38,13 @@ impl TeamsClient {
             "https://teams.microsoft.com/api/chatsvc/emea/v1/users/ME/conversations/{}/messages",
             thread_part
         );
+        let ps = page_size.min(200).to_string();
         let res = self
             .tokens
             .http()
             .get(&url)
             .bearer_auth(&token)
-            .query(&[("pageSize", page_size.min(200).to_string())])
+            .query(&[("pageSize", ps.as_str())])
             .send()
             .await?;
         let status = res.status();
@@ -110,18 +111,23 @@ impl TeamsClient {
         if !status.is_success() {
             bail!("fetchShortProfile failed: HTTP {}: {}", status, &text[..text.len().min(300)]);
         }
+        if text.trim().is_empty() {
+            // 204 No Content: the mt/part endpoint returned nothing for this tenant.
+            return Ok(serde_json::json!([]));
+        }
         Ok(serde_json::from_str(&text)?)
     }
 
     /// Graph directory search (contacts).
     pub async fn graph_users(&self, top: u32) -> Result<serde_json::Value> {
         let token = self.tokens.token(SCOPE_GRAPH).await?;
+        let top_s = top.min(50).to_string();
         let res = self
             .tokens
             .http()
             .get("https://graph.microsoft.com/v1.0/users")
             .bearer_auth(&token)
-            .query(&[("$select", "id,displayName,userPrincipalName,mail,jobTitle"), ("$top", top.min(50).to_string())])
+            .query(&[("$select", "id,displayName,userPrincipalName,mail,jobTitle"), ("$top", top_s.as_str())])
             .send()
             .await?;
         let status = res.status();

@@ -12,7 +12,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::auth::TokenManager;
 use crate::config::{Config, SCOPE_CHATSVCAGG};
 use crate::models::*;
 use crate::teams::TeamsClient;
@@ -20,7 +19,7 @@ use crate::teams::TeamsClient;
 pub struct AppState {
     pub cfg: Config,
     pub teams: TeamsClient,
-    dir: RwLock<Option<(i64, DirCache)>>,
+    pub dir: RwLock<Option<(i64, DirCache)>>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -106,10 +105,6 @@ impl AppState {
 
     fn chat_is_allowed(&self, chat: &ChatRecord) -> bool {
         chat.title.as_ref().map(|t| self.cfg.allowed_groups.contains(&t.to_lowercase())).unwrap_or(false)
-    }
-
-    fn team_is_allowed(&self, team: &TeamRecord) -> bool {
-        self.cfg.allowed_groups.contains(&team.name.to_lowercase())
     }
 
     /// MRIs and object ids of members of allowlisted group chats.
@@ -246,7 +241,7 @@ fn messages_out(v: &Value) -> Vec<Value> {
                 "id": s(m, "id").unwrap_or_default(),
                 "from": s(m, "from"),
                 "fromName": s(m, "imDisplayName").or_else(|| s(m, "imdisplayname")),
-                "time": s(m, "originalArrivalTime").or_else(|| s(m, "composeTime")),
+                "time": s(m, "originalArrivalTime").or_else(|| s(m, "originalarrivaltime")).or_else(|| s(m, "composeTime")).or_else(|| s(m, "composetime")),
                 "content": s(m, "content"),
                 "messageType": s(m, "messageType").or_else(|| s(m, "messagetype")),
             }));
@@ -313,7 +308,7 @@ async fn list_contacts(State(state): State<SharedState>) -> Result<Json<Value>, 
     let dir = state.dir().await?;
     let mut contacts: Vec<ContactOut> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut push = |id: String, c: ContactOut, contacts: &mut Vec<ContactOut>, seen: &mut HashSet<String>| {
+    let push = |id: String, c: ContactOut, contacts: &mut Vec<ContactOut>, seen: &mut HashSet<String>| {
         let key = id.to_lowercase();
         if seen.insert(key) { contacts.push(c); }
     };
@@ -374,46 +369,45 @@ async fn list_contacts(State(state): State<SharedState>) -> Result<Json<Value>, 
 }
 
 async fn get_contact(State(state): State<SharedState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
-    let me_err = |e: anyhow::Error| ApiError::new(StatusCode::BAD_GATEWAY, e.to_string());
-    if id.starts_with("8:") {
-        let v = state.teams.fetch_short_profiles(&[id.clone()]).await.map_err(me_err)?;
-        let item = v.as_array().and_then(|a| a.first())
-            .or_else(|| v.get("value").and_then(|x| x.as_array()).and_then(|a| a.first()));
-        if let Some(p) = item {
-            let given = s(p, "givenName").unwrap_or_default();
-            let surname = s(p, "surname").unwrap_or_default();
-            let name = s(p, "displayName").unwrap_or_else(|| format!("{} {}", given, surname).trim().to_string());
-            return Ok(Json(json!({ "contact": {
-                "id": id, "displayName": name,
-                "upn": s(p, "userPrincipalName"), "email": s(p, "email"),
-                "jobTitle": s(p, "jobTitle"), "department": s(p, "department"),
-                "mri": s(p, "mri").unwrap_or(id),
-            } })));
-        }
-        return Err(ApiError::new(StatusCode::NOT_FOUND, format!("contact {} not found", id)));
-    }
-    // AAD object id: try Graph first, fall back to short profile
-    match state.teams.graph_user(&id).await {
-        Ok(v) => Ok(Json(json!({ "contact": {
-            "id": id,
-            "displayName": s(&v, "displayName").unwrap_or_default(),
-            "upn": s(&v, "userPrincipalName"), "email": s(&v, "mail"),
-            "jobTitle": s(&v, "jobTitle"), "department": s(&v, "department"),
-        } }))),
-        Err(_) => {
-            let v = state.teams.fetch_short_profiles(&[id.clone()]).await.map_err(me_err)?;
-            let item = v.as_array().and_then(|a| a.first());
-            match item {
-                Some(p) => Ok(Json(json!({ "contact": {
+    // Normalize MRI prefixes so Graph lookups use the raw AAD id.
+    let raw = id.trim_start_matches("8:orgid:").trim_start_matches("8:").to_string();
+    let g = state.teams.graph_user(&raw).await;
+    match g {
+        Ok(v) => {
+            let display_name = s(&v, "displayName").unwrap_or_default();
+            if !display_name.is_empty() {
+                return Ok(Json(json!({ "contact": {
                     "id": id,
-                    "displayName": s(p, "displayName").unwrap_or_default(),
-                    "upn": s(p, "userPrincipalName"), "email": s(p, "email"),
-                    "jobTitle": s(p, "jobTitle"), "department": s(p, "department"),
-                } }))),
-                None => Err(ApiError::new(StatusCode::NOT_FOUND, format!("contact {} not found", id))),
+                    "displayName": display_name,
+                    "upn": s(&v, "userPrincipalName"),
+                    "email": s(&v, "mail"),
+                    "jobTitle": s(&v, "jobTitle"),
+                    "department": s(&v, "department"),
+                } })));
             }
         }
+        Err(e) => tracing::warn!("graph_user({}) failed: {}", raw, e),
     }
+    // Fallback: Teams short profile (may be empty for some tenants).
+    let v = state.teams.fetch_short_profiles(&[id.clone()]).await
+        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let item = v.as_array().and_then(|a| a.first())
+        .or_else(|| v.get("value").and_then(|x| x.as_array()).and_then(|a| a.first()));
+    if let Some(p) = item {
+        let given = s(p, "givenName").unwrap_or_default();
+        let surname = s(p, "surname").unwrap_or_default();
+        let name = s(p, "displayName").unwrap_or_else(|| format!("{} {}", given, surname).trim().to_string());
+        return Ok(Json(json!({ "contact": {
+            "id": id,
+            "displayName": name,
+            "upn": s(p, "userPrincipalName"),
+            "email": s(p, "email"),
+            "jobTitle": s(p, "jobTitle"),
+            "department": s(p, "department"),
+            "mri": s(p, "mri").unwrap_or(id),
+        } })));
+    }
+    Err(ApiError::new(StatusCode::NOT_FOUND, format!("contact {} not found", id)))
 }
 
 /// Find the 1:1 chat whose other member matches the contact id.

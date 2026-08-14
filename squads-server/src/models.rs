@@ -64,6 +64,7 @@ pub struct ChannelOut {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MemberOut {
     pub mri: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -75,6 +76,7 @@ pub struct MemberOut {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ContactOut {
     pub id: String,
     pub display_name: String,
@@ -88,6 +90,7 @@ pub struct ContactOut {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MessageOut {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]

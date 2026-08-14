@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "REST server exposing read/send Teams APIs on top of Squads auth flow"
 
+[workspace]
+
 [dependencies]
 anyhow = "1"
 axum = "0.8"
