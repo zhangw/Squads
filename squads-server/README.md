@@ -59,3 +59,20 @@ curl -H "Authorization: Bearer <your-api-token>" \
 | `SQUADS_ALLOWED_GROUPS` | `low latency engine devops` | group names allowed to receive messages |
 | `SQUADS_REFRESH_TOKEN` | - | Teams refresh token (alternative to the file) |
 | `SQUADS_TOKEN_STORE` | `/private/tmp/squads-server-tokens.json` | where the refresh token is read/persisted |
+
+## Reference client (squads-cli)
+
+```bash
+cargo build --bin squads-cli
+export SQUADS_API_TOKEN="<your-api-token>"
+./target/debug/squads-cli groups
+./target/debug/squads-cli group-info 19%3A08fb87b4a3824dcaa659e442053d6825%40thread.v2
+./target/debug/squads-cli group-msgs 19%3A08fb87b4a3824dcaa659e442053d6825%40thread.v2
+./target/debug/squads-cli group-send 19%3A08fb87b4a3824dcaa659e442053d6825%40thread.v2 "hello group"
+./target/debug/squads-cli contacts
+./target/debug/squads-cli contact-info 8%3Aorgid%3A57bc4823-ffeb-4e3b-a0d2-ed5453b44a92
+./target/debug/squads-cli contact-msgs 8%3Aorgid%3A57bc4823-ffeb-4e3b-a0d2-ed5453b44a92
+./target/debug/squads-cli contact-send 8%3Aorgid%3A57bc4823-ffeb-4e3b-a0d2-ed5453b44a92 "hello contact"
+```
+
+Group/contact ids containing `:` or `@` must be URL-encoded in the path.

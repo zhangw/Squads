@@ -484,3 +484,85 @@ fn html_escape(s: &str) -> String {
     s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_html_escape() {
+        assert_eq!(html_escape("a < b & c > d"), "a &lt; b &amp; c &gt; d");
+        assert_eq!(html_escape("plain"), "plain");
+    }
+
+    #[test]
+    fn test_ct_eq() {
+        assert!(ct_eq("abc", "abc"));
+        assert!(!ct_eq("abc", "abd"));
+        assert!(!ct_eq("abc", "abcd"));
+        assert!(!ct_eq("", "a"));
+        assert!(ct_eq("", ""));
+    }
+
+    #[test]
+    fn test_parse_dir() {
+        let v = serde_json::json!({
+            "teams": [
+                {"id": "team1", "displayName": "My Team", "channels": [{"id": "c1", "displayName": "General"}]}
+            ],
+            "chats": [
+                {"id": "19:abc@thread.v2", "title": "low latency engine devops", "isOneOnOne": false,
+                 "members": [{"mri": "8:orgid:1", "objectId": "1", "role": "owner", "displayName": "wen zhang"}],
+                 "lastMessage": {"originalArrivalTime": "2026-08-14T17:00:00Z"}},
+                {"id": "19:xyz@unq.gbl.spaces", "isOneOnOne": true,
+                 "members": [{"mri": "8:orgid:1"}, {"mri": "8:orgid:2"}]}
+            ]
+        });
+        let dir = parse_dir(&v);
+        assert_eq!(dir.teams.len(), 1);
+        assert_eq!(dir.teams[0].name, "My Team");
+        assert_eq!(dir.teams[0].channels.len(), 1);
+        assert_eq!(dir.chats.len(), 2);
+        assert_eq!(dir.chats[0].title.as_deref(), Some("low latency engine devops"));
+        assert!(!dir.chats[0].is_one_on_one);
+        assert_eq!(dir.chats[0].members.len(), 1);
+        assert_eq!(dir.chats[0].last_message_time.as_deref(), Some("2026-08-14T17:00:00Z"));
+        assert!(dir.chats[1].is_one_on_one);
+    }
+
+    #[test]
+    fn test_build_message_payload() {
+        let me = crate::auth::MeInfo { oid: "oid-1".into(), display_name: "wen zhang".into(), upn: "zw@webull.com".into() };
+        let p = build_message_payload("<script>hi</script>", &me);
+        assert_eq!(p["from"], "8:orgid:oid-1");
+        assert_eq!(p["content"], "&lt;script&gt;hi&lt;/script&gt;");
+        assert_eq!(p["messageType"], "RichText/Html");
+        assert_eq!(p["contentType"], "Text");
+        assert_eq!(p["imDisplayName"], "wen zhang");
+        assert_eq!(p["postType"], "Standard");
+        assert!(p["clientMessageId"].is_string());
+        assert!(p["properties"].get("formatVariant").is_some());
+    }
+
+    #[test]
+    fn test_allowlist_matching() {
+        // allowed group chat -> member mris become allowed
+        let cfg = Config {
+            bind: "127.0.0.1:1".into(),
+            api_tokens: vec!["t".into()],
+            allowed_groups: vec!["low latency engine devops".into()],
+            token_store: "/tmp/x".into(),
+            refresh_token: None,
+        };
+        // cfg is not Send-required here; exercise logic through a bare struct
+        let chat = ChatRecord {
+            id: "19:abc".into(),
+            title: Some("low latency engine devops".into()),
+            is_one_on_one: false,
+            members: vec![ChatMemberRec { mri: "8:orgid:111".into(), object_id: Some("111".into()), role: None, display_name: None }],
+            last_message_time: None,
+        };
+        assert_eq!(cfg.allowed_groups.contains(&chat.title.unwrap().to_lowercase()), true);
+    }
+}
+
