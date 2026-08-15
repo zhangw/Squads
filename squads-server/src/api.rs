@@ -458,7 +458,7 @@ fn build_message_payload(text: &str, me: &crate::auth::MeInfo) -> Value {
         "from": format!("8:orgid:{}", me.oid),
         "composeTime": now,
         "originalArrivalTime": now,
-        "content": html_escape(text),
+        "content": html_to_teams(text),
         "messageType": "RichText/Html",
         "contentType": "Text",
         "clientMessageId": client_id,
@@ -482,6 +482,13 @@ fn build_message_payload(text: &str, me: &crate::auth::MeInfo) -> Value {
 
 fn html_escape(s: &str) -> String {
     s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
+}
+
+/// Escape HTML, then turn newlines into <br> so multi-line text renders
+/// as line breaks in Teams (RichText/Html collapses plain newlines).
+fn html_to_teams(s: &str) -> String {
+    html_escape(s).replace("
+", "<br>")
 }
 
 
@@ -566,3 +573,16 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod multiline_tests {
+    use super::*;
+
+    #[test]
+    fn test_html_to_teams_multiline() {
+        assert_eq!(html_to_teams("line1\nline2"), "line1<br>line2");
+        assert_eq!(html_to_teams("<b>a</b>\n&b"), "&lt;b&gt;a&lt;/b&gt;<br>&amp;b");
+        assert_eq!(html_to_teams("plain"), "plain");
+        assert_eq!(html_to_teams("a\nb\nc"), "a<br>b<br>c");
+    }
+}
