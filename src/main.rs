@@ -1,5 +1,6 @@
 mod api;
 mod api_types;
+mod security;
 mod components;
 mod parsing;
 use base64::Engine;
@@ -1573,8 +1574,13 @@ impl Counter {
                 Task::none()
             }
             Message::LinkClicked(url) => {
-                if !webbrowser::open(url.as_str()).is_ok() {
-                    eprintln!("Failed to open link : {}", url);
+                // Security: only http/https links may reach OS URL handlers.
+                if security::is_safe_web_link(&url) {
+                    if !webbrowser::open(url.as_str()).is_ok() {
+                        eprintln!("Failed to open link : {}", url);
+                    }
+                } else {
+                    eprintln!("Security: blocked unsafe link scheme in {}", url);
                 }
 
                 Task::none()
@@ -2589,8 +2595,10 @@ impl Counter {
                         if let Ok(skype_token) =
                             get_or_gen_skype_token(acess_tokens_arc, token).await
                         {
-                            let bytes = authorize_image(&skype_token, &url).await.unwrap();
-                            save_cached_image(identifier, "jpeg", bytes);
+                            match authorize_image(&skype_token, &url).await {
+                                Ok(bytes) => save_cached_image(identifier, "jpeg", bytes),
+                                Err(e) => eprintln!("Image authorization failed: {}", e),
+                            }
                         }
                     },
                     Message::DoNothing,
@@ -2598,11 +2606,53 @@ impl Counter {
             }
             Message::DownloadImage(url, identifier) => Task::perform(
                 async move {
-                    let client = Client::new();
-                    let response = client.get(url).send().await.unwrap();
-                    let bytes = response.bytes().await.unwrap();
-
-                    save_cached_image(identifier, "gif", bytes);
+                    // Security: allowlisted Giphy origins only, no redirects,
+                    // private-address rejection and a hard size budget.
+                    if !security::is_allowed_giphy_url(&url) {
+                        eprintln!("Security: rejecting non-Giphy image URL");
+                        return;
+                    }
+                    if let Ok(parsed) = url::Url::parse(&url) {
+                        if let Some(host) = parsed.host_str() {
+                            if security::host_is_local_or_private(host) {
+                                eprintln!("Security: rejecting private/loopback image host");
+                                return;
+                            }
+                        }
+                    }
+                    let client = match Client::builder()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .timeout(Duration::from_secs(30))
+                        .build()
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("Failed to build http client: {}", e);
+                            return;
+                        }
+                    };
+                    match client.get(&url).send().await {
+                        Ok(mut response) => {
+                            if !response.status().is_success() {
+                                eprintln!("Image download failed: HTTP {}", response.status());
+                                return;
+                            }
+                            if let Some(len) = response.content_length() {
+                                if len > security::MAX_MEDIA_BYTES as u64 {
+                                    eprintln!("Security: image exceeds size limit");
+                                    return;
+                                }
+                            }
+                            match security::read_limited(&mut response, security::MAX_MEDIA_BYTES).await {
+                                Ok(bytes) if security::is_gif(&bytes) => {
+                                    save_cached_image(identifier, "gif", bytes);
+                                }
+                                Ok(_) => eprintln!("Security: invalid GIF magic rejected"),
+                                Err(e) => eprintln!("Security: {}", e),
+                            }
+                        }
+                        Err(e) => eprintln!("Image download failed: {}", e),
+                    }
                 },
                 Message::DoNothing,
             ),

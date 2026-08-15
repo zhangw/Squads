@@ -81,14 +81,14 @@ impl TokenManager {
             tenant: Some(TENANT.to_string()),
         })
         .unwrap_or_default();
-        if let Some(parent) = self.store_path.parent() {
+        let path = (*self.store_path).clone();
+        if let Some(parent) = path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
-        let _ = tokio::fs::write(&*self.store_path, data).await;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = tokio::fs::set_permissions(&*self.store_path, std::fs::Permissions::from_mode(0o600)).await;
+        // Security: create-new 0600 temp file + atomic rename; failures are
+        // visible and never leave a permissive secret behind.
+        if let Err(e) = tokio::task::spawn_blocking(move || write_atomic_private(&path, data.as_bytes())).await {
+            tracing::error!("token persistence task failed: {}", e);
         }
     }
 
@@ -197,4 +197,50 @@ impl TokenManager {
         *self.me.write().await = Some(me.clone());
         Ok(me)
     }
+}
+
+
+/// Same-directory temp file with mode 0600 from creation, then atomic rename.
+#[cfg(unix)]
+fn write_atomic_private(target: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = target.parent().unwrap_or(std::path::Path::new("."));
+    let name = target.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let tmp = dir.join(format!(".{}.{}.tmp", name, std::process::id()));
+    let result = (|| {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true).mode(0o600);
+        let mut f = opts.open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, target)?;
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(not(unix))]
+fn write_atomic_private(target: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = target.parent().unwrap_or(std::path::Path::new("."));
+    let name = target.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let tmp = dir.join(format!(".{}.{}.tmp", name, std::process::id()));
+    let result = (|| {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, target)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }

@@ -2,7 +2,7 @@ use directories::ProjectDirs;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::{
-    env, fs, io::Write, path::{PathBuf}, time::{SystemTime, UNIX_EPOCH}
+    env, fs, io::Write, path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH}
 };
 
 pub fn truncate_name(name: String, max_length: usize) -> String {
@@ -51,6 +51,55 @@ pub fn get_cache<T: DeserializeOwned>(filename: &str) -> Option<T> {
         serde_json::from_str(&file_content).ok()
     } else {
         None
+    }
+}
+
+/// Persist secrets (access_tokens.json) with create-new 0600 semantics and an
+/// atomic rename: the secret never exists with permissive permissions and a
+/// pre-existing symlink at the target is replaced, not followed.
+pub fn save_private_to_cache<T>(filename: &str, content: &T)
+where
+    T: Serialize,
+{
+    let project_dirs = ProjectDirs::from("", "ianterzo", "squads");
+    let cache_dir = project_dirs.unwrap().cache_dir().to_path_buf();
+    fs::create_dir_all(&cache_dir).expect("Failed to create cache directory");
+
+    let json = serde_json::to_string_pretty(content).expect("Failed to serialize content");
+    write_atomic_private(&cache_dir.join(filename), json.as_bytes());
+}
+
+fn write_atomic_private(target: &Path, data: &[u8]) {
+    let dir = target.parent().unwrap_or(Path::new("."));
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "secret".to_string());
+    let tmp = dir.join(format!(".{}.{}.tmp", name, std::process::id()));
+    let res = (|| -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create_new(true).mode(0o600);
+            let mut f = opts.open(&tmp)?;
+            f.write_all(data)?;
+            f.sync_all()?;
+            fs::rename(&tmp, target)?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            f.write_all(data)?;
+            f.sync_all()?;
+            fs::rename(&tmp, target)?;
+            Ok(())
+        }
+    })();
+    if let Err(e) = res {
+        let _ = fs::remove_file(&tmp);
+        eprintln!("Failed to persist credential cache {}: {}", target.display(), e);
     }
 }
 

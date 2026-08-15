@@ -23,6 +23,7 @@ async fn main() -> anyhow::Result<()> {
         cfg: cfg.clone(),
         teams,
         dir: RwLock::new(None),
+        allowlist_ids: std::sync::RwLock::new(None),
     });
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(&cfg.bind).await?;

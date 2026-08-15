@@ -1,5 +1,5 @@
 use crate::api::{AccessToken, gen_skype_token, gen_token, renew_refresh_token};
-use crate::utils::{delete_cache, get_epoch_s, save_to_cache};
+use crate::utils::{delete_cache, get_epoch_s, save_private_to_cache};
 use iced::Task;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -96,7 +96,7 @@ pub async fn get_or_gen_token(
                 let mut tokens = access_tokens.write().unwrap();
                 tokens.insert(scope.to_string(), new_token.clone());
             }
-            save_to_cache("access_tokens.json", &*access_tokens.read().unwrap());
+            save_private_to_cache("access_tokens.json", &*access_tokens.read().unwrap());
             Ok(new_token)
         }
         Err(e) => {
@@ -132,7 +132,7 @@ pub async fn get_or_gen_skype_token(
         tokens.insert("skype_token".to_string(), new_token.clone());
     }
 
-    save_to_cache("access_tokens.json", &*access_tokens.read().unwrap());
+    save_private_to_cache("access_tokens.json", &*access_tokens.read().unwrap());
 
     Ok(new_token)
 }

@@ -10,6 +10,13 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+/// Hard cap on decoded animation frames (CPU/memory budget).
+const MAX_GIF_FRAMES: usize = 600;
+
+/// 1x1 transparent GIF used as a frozen placeholder for unreadable media.
+const BLANK_GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
+
 struct State<'a> {
     index: usize,
     frames: Frames<'a>,
@@ -196,11 +203,29 @@ where
     }
 
     fn state(&self) -> tree::State {
-        let bytes = fs::read(self.path.clone()).unwrap();
-        let decoder = gif::GifDecoder::new(io::Cursor::new(bytes)).unwrap();
+        // Security: unreadable or non-GIF bytes fall back to a frozen blank
+        // frame instead of panicking on remote-controlled media.
+        let bytes = match fs::read(self.path.clone()) {
+            Ok(b) if crate::security::is_gif(&b) => b,
+            _ => BLANK_GIF.to_vec(),
+        };
+        let decoder = gif::GifDecoder::new(io::Cursor::new(bytes)).unwrap_or_else(|_| {
+            gif::GifDecoder::new(io::Cursor::new(BLANK_GIF.to_vec())).expect("blank gif must decode")
+        });
         let mut frames = decoder.into_frames();
 
-        let frame = frames.by_ref().nth(0).unwrap().unwrap();
+        let frame = match frames.by_ref().next() {
+            Some(Ok(f)) => f,
+            _ => {
+                // Empty or undecodable GIF: keep the blank fallback iterator.
+                let mut fallback = gif::GifDecoder::new(io::Cursor::new(BLANK_GIF.to_vec()))
+                    .expect("blank gif must decode")
+                    .into_frames();
+                let f = fallback.next().expect("blank gif frame").expect("blank gif frame");
+                frames = fallback;
+                f
+            }
+        };
 
         tree::State::new(State {
             index: 0,
@@ -272,9 +297,21 @@ where
             if elapsed > delay {
                 // Take all the frames during the first run
                 let next_frame = if let Some(frame_result) = state.frames.next() {
-                    let frame = frame_result.unwrap();
-                    state.collecte_frames.push(frame.clone());
-                    frame
+                    match frame_result {
+                        Ok(frame) => {
+                            if state.collecte_frames.len() < MAX_GIF_FRAMES {
+                                state.collecte_frames.push(frame.clone());
+                            }
+                            frame
+                        }
+                        Err(e) => {
+                            eprintln!("GIF frame decode error: {}", e);
+                            return;
+                        }
+                    }
+                } else if state.collecte_frames.is_empty() {
+                    // Single-frame GIF: freeze on the only frame (avoids modulo-by-zero).
+                    return;
                 } else {
                     state.index = (state.index + 1) % state.collecte_frames.len();
                     state.collecte_frames[state.index].clone()

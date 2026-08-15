@@ -8,9 +8,16 @@ use std::str::FromStr;
 use std::{
     fs::{File, create_dir_all},
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
 };
 pub fn save_cached_image(identifier: String, extension: &str, bytes: Bytes) {
+    // Security: only write validated media within the size budget.
+    if bytes.len() > crate::security::MAX_MEDIA_BYTES
+        || !crate::security::validate_media_bytes(extension, &bytes)
+    {
+        eprintln!("Security: rejecting invalid media for {}", identifier);
+        return;
+    }
     let project_dirs = ProjectDirs::from("", "ianterzo", "squads");
 
     let mut cache_dir = project_dirs.unwrap().cache_dir().to_path_buf();
@@ -20,10 +27,52 @@ pub fn save_cached_image(identifier: String, extension: &str, bytes: Bytes) {
         create_dir_all(&cache_dir).expect("Failed to create image-cache directory");
     }
 
-    cache_dir.push(format!("{}.{}", identifier, extension));
-    if !cache_dir.exists() {
-        let mut file = File::create(cache_dir).unwrap();
-        let _ = file.write_all(&bytes);
+    enforce_cache_budget(&cache_dir);
+
+    let target = cache_dir.join(format!("{}.{}", identifier, extension));
+    if target.exists() {
+        return;
+    }
+    // Atomic write: temp file in the same directory, then rename.
+    let tmp = cache_dir.join(format!(".{}.{}.tmp", identifier, std::process::id()));
+    let mut ok = false;
+    if let Ok(mut file) = File::create(&tmp) {
+        ok = file.write_all(&bytes).is_ok() && file.sync_all().is_ok();
+    }
+    if ok {
+        let _ = std::fs::rename(&tmp, &target);
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Keep the media cache within a total budget; evict oldest files first.
+fn enforce_cache_budget(cache_dir: &Path) {
+    const MAX_TOTAL: u64 = 256 * 1024 * 1024; // 256 MiB
+    let mut entries: Vec<(std::time::SystemTime, PathBuf, u64)> = Vec::new();
+    let mut total: u64 = 0;
+    if let Ok(rd) = std::fs::read_dir(cache_dir) {
+        for e in rd.flatten() {
+            if let Ok(md) = e.metadata() {
+                if md.is_file() {
+                    total += md.len();
+                    let t = md.modified().unwrap_or(std::time::UNIX_EPOCH);
+                    entries.push((t, e.path(), md.len()));
+                }
+            }
+        }
+    }
+    if total <= MAX_TOTAL {
+        return;
+    }
+    entries.sort_by_key(|(t, _, _)| *t);
+    for (_, p, len) in entries {
+        if total <= MAX_TOTAL {
+            break;
+        }
+        if std::fs::remove_file(&p).is_ok() {
+            total = total.saturating_sub(len);
+        }
     }
 }
 

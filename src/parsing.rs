@@ -1,6 +1,7 @@
 use crate::Message;
 use crate::components::cached_image::c_cached_gif;
 use crate::components::cached_image::c_cached_image;
+use crate::security;
 use crate::style;
 use crate::widgets::circle::circle;
 use crate::widgets::selectable_rich_text::selectable_rich_text;
@@ -313,8 +314,18 @@ fn transform_html<'a>(
                             );
                         }
                     } else if itemtype == "http://schema.skype.com/AMSImage" {
+                        // Security: never schedule a token-bearing fetch for an
+                        // unvalidated message-selected URL.
+                        let Some(src_attr) = child_element.attr("src") else {
+                            dynamic_container = dynamic_container.push(text!("Image unavailable").into());
+                            continue;
+                        };
+                        let image_url = src_attr.to_string();
+                        if !security::is_allowed_ams_image_url(&image_url) {
+                            dynamic_container = dynamic_container.push(text!("Image unavailable").into());
+                            continue;
+                        }
                         // most consistent way to get the image id
-                        let image_url = child_element.attr("src").unwrap().to_string();
                         let identifier = image_url
                             .replace("https:", "")
                             .replace("/", "")
@@ -338,13 +349,15 @@ fn transform_html<'a>(
                             }
                             Err(_e) => {
                                 if let Some(width) = child_element.attr("width") {
-                                    let width = width.parse().unwrap();
-                                    image_width = width;
+                                    if let Ok(w) = width.parse::<f32>() {
+                                        image_width = w;
+                                    }
                                 }
 
                                 if let Some(height) = child_element.attr("height") {
-                                    let height = height.parse().unwrap();
-                                    image_height = height;
+                                    if let Ok(h) = height.parse::<f32>() {
+                                        image_height = h;
+                                    }
                                 }
                             }
                         }
@@ -380,20 +393,28 @@ fn transform_html<'a>(
 
                         dynamic_container = dynamic_container.push(team_picture.into());
                     } else if itemtype == "http://schema.skype.com/Giphy" {
-                        if let Some(image_url) = child_element.attr("src") {
+                        if let Some(src_attr) = child_element.attr("src") {
+                            // Security: only allowlisted Giphy origins may be fetched.
+                            if !security::is_allowed_giphy_url(src_attr) {
+                                dynamic_container = dynamic_container.push(text!("Gif unavailable").into());
+                                continue;
+                            }
+                            let image_url = src_attr.to_string();
                             let identifier = xxh3_64(image_url.to_string().as_bytes()).to_string();
 
                             let mut image_width = 250.0;
                             let mut image_height = 250.0;
 
                             if let Some(width) = child_element.attr("width") {
-                                let width = width.parse().unwrap();
-                                image_width = width;
+                                if let Ok(w) = width.parse::<f32>() {
+                                    image_width = w;
+                                }
                             }
 
                             if let Some(height) = child_element.attr("height") {
-                                let height = height.parse().unwrap();
-                                image_height = height;
+                                if let Ok(h) = height.parse::<f32>() {
+                                    image_height = h;
+                                }
                             }
                             let team_picture = click_area(c_cached_gif(
                                 identifier.clone(),
@@ -686,10 +707,15 @@ pub fn parse_card_html<'a>(content: String) -> Result<Element<'a, Message>, Stri
     let selector = Selector::parse("Swift").unwrap();
 
     if let Some(swift_element) = document.select(&selector).next() {
-        let b64_value = swift_element.value().attr("b64").unwrap();
+        let Some(b64_value) = swift_element.value().attr("b64") else {
+            return Err("Swift tag missing b64 attribute".to_string());
+        };
 
-        let decoded_bytes = STANDARD.decode(b64_value).unwrap();
-        let decoded_string = std::str::from_utf8(&decoded_bytes).unwrap();
+        let decoded_bytes = STANDARD
+            .decode(b64_value)
+            .map_err(|e| format!("invalid base64 in card HTML: {}", e))?;
+        let decoded_string = std::str::from_utf8(&decoded_bytes)
+            .map_err(|e| format!("invalid UTF-8 in card HTML: {}", e))?;
         //let parsed: MediaCard = serde_json::from_str(decoded_string).unwrap();
         //println!("{parsed:#?}");
         Ok(text!("{decoded_string}").into())

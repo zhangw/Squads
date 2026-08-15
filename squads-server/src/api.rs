@@ -20,6 +20,8 @@ pub struct AppState {
     pub cfg: Config,
     pub teams: TeamsClient,
     pub dir: RwLock<Option<(i64, DirCache)>>,
+    /// Resolved send allowlist: immutable chat thread ids only.
+    pub allowlist_ids: std::sync::RwLock<Option<HashSet<String>>>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -91,8 +93,34 @@ impl AppState {
         }
         let v = self.teams.teams_me().await.map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e.to_string()))?;
         let cache = parse_dir(&v);
+        self.resolve_allowlist(&cache);
         *self.dir.write().await = Some((now, cache.clone()));
         Ok(cache)
+    }
+
+    /// Resolve allowlist entries to immutable thread ids. Entries starting with
+    /// "19:" are used verbatim; other entries are matched case-insensitively
+    /// against chat titles and must resolve to exactly one chat (fail closed).
+    fn resolve_allowlist(&self, cache: &DirCache) {
+        for entry in &self.cfg.allowed_groups {
+            if !entry.starts_with("19:") {
+                let entry_l = entry.to_lowercase();
+                let matches: Vec<String> = cache
+                    .chats
+                    .iter()
+                    .filter(|c| !c.is_one_on_one)
+                    .filter(|c| c.title.as_ref().map(|t| t.to_lowercase() == entry_l).unwrap_or(false))
+                    .map(|c| c.id.clone())
+                    .collect();
+                match matches.len() {
+                    1 => {}
+                    0 => tracing::warn!("allowlisted group {:?} matches no group chat (fail closed)", entry),
+                    _ => tracing::error!("allowlisted group {:?} is ambiguous ({} chats); refusing to allow any (fail closed)", entry, matches.len()),
+                }
+            }
+        }
+        let ids = resolve_allowlist_ids(&self.cfg.allowed_groups, cache);
+        *self.allowlist_ids.write().unwrap() = Some(ids);
     }
 
     fn find_chat(&self, dir: &DirCache, id: &str) -> Option<ChatRecord> {
@@ -104,7 +132,13 @@ impl AppState {
     }
 
     fn chat_is_allowed(&self, chat: &ChatRecord) -> bool {
-        chat.title.as_ref().map(|t| self.cfg.allowed_groups.contains(&t.to_lowercase())).unwrap_or(false)
+        // Authorization binds to immutable thread ids, never mutable titles.
+        self.allowlist_ids
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|ids| ids.contains(&chat.id))
+            .unwrap_or(false)
     }
 
     /// MRIs and object ids of members of allowlisted group chats.
@@ -123,10 +157,57 @@ impl AppState {
     }
 
     fn contact_is_allowed_member(&self, dir: &DirCache, contact_id: &str) -> bool {
+        let Some(n) = normalize_contact_id(contact_id) else {
+            return false;
+        };
         let (mris, oids) = self.allowed_member_ids(dir);
-        let cid = contact_id.to_lowercase();
-        mris.contains(&cid) || oids.contains(&cid) || mris.iter().any(|m| m.ends_with(&cid))
+        mris.contains(&n.mri) || oids.contains(&n.oid)
     }
+}
+
+/// Resolve allowlist entries to immutable thread ids.
+/// Entries starting with "19:" pass through verbatim; other entries match chat
+/// titles case-insensitively and must resolve to exactly one chat (fail closed).
+fn resolve_allowlist_ids(entries: &[String], cache: &DirCache) -> HashSet<String> {
+    let mut ids: HashSet<String> = HashSet::new();
+    for entry in entries {
+        if entry.starts_with("19:") {
+            ids.insert(entry.clone());
+            continue;
+        }
+        let entry_l = entry.to_lowercase();
+        let matches: Vec<String> = cache
+            .chats
+            .iter()
+            .filter(|c| !c.is_one_on_one)
+            .filter(|c| c.title.as_ref().map(|t| t.to_lowercase() == entry_l).unwrap_or(false))
+            .map(|c| c.id.clone())
+            .collect();
+        if matches.len() == 1 {
+            ids.insert(matches[0].clone());
+        }
+    }
+    ids
+}
+
+/// Canonical contact identity: a complete MRI (8:orgid:<id>) or a bare AAD
+/// object id. Partial, empty or ambiguous forms are rejected.
+struct NormalizedContact {
+    mri: String,
+    oid: String,
+}
+
+fn normalize_contact_id(id: &str) -> Option<NormalizedContact> {
+    let raw = id.trim();
+    let tail = raw.strip_prefix("8:orgid:").unwrap_or(raw);
+    // Complete object-id form only: at least 8 chars of hex/dash.
+    if tail.is_empty() || tail.len() < 8 || !tail.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return None;
+    }
+    Some(NormalizedContact {
+        mri: format!("8:orgid:{}", tail).to_lowercase(),
+        oid: tail.to_lowercase(),
+    })
 }
 
 fn s(v: &Value, key: &str) -> Option<String> {
@@ -410,15 +491,16 @@ async fn get_contact(State(state): State<SharedState>, Path(id): Path<String>) -
     Err(ApiError::new(StatusCode::NOT_FOUND, format!("contact {} not found", id)))
 }
 
-/// Find the 1:1 chat whose other member matches the contact id.
+/// Find the 1:1 chat whose other member matches the canonical contact id.
+/// Exact match only: partial or suffix identifiers never match.
 fn find_one_on_one(dir: &DirCache, contact_id: &str) -> Option<ChatRecord> {
-    let cid = contact_id.to_lowercase();
+    let n = normalize_contact_id(contact_id)?;
     dir.chats.iter().find(|c| {
-        c.is_one_on_one && c.members.iter().any(|m| {
-            let mri = m.mri.to_lowercase();
-            mri == cid || mri.ends_with(&cid)
-                || m.object_id.as_ref().map(|o| o.to_lowercase() == cid).unwrap_or(false)
-        })
+        c.is_one_on_one
+            && c.members.iter().any(|m| {
+                m.mri.to_lowercase() == n.mri
+                    || m.object_id.as_ref().map(|o| o.to_lowercase() == n.oid).unwrap_or(false)
+            })
     }).cloned()
 }
 
@@ -438,12 +520,18 @@ async fn send_contact_message(State(state): State<SharedState>, Path(id): Path<S
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "text must not be empty"));
     }
     let dir = state.dir().await?;
+    let Some(norm) = normalize_contact_id(&id) else {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "contact id must be a complete MRI (8:orgid:<id>) or AAD object id"));
+    };
+    let me = state.teams.tokens.me().await.map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e.to_string()))?;
+    if me.oid.to_lowercase() == norm.oid {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "cannot send a message to yourself"));
+    }
     if !state.contact_is_allowed_member(&dir, &id) {
         return Err(ApiError::new(StatusCode::FORBIDDEN, "contact is not a member of an allowlisted group"));
     }
     let chat = find_one_on_one(&dir, &id)
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("no 1:1 chat with contact {}", id)))?;
-    let me = state.teams.tokens.me().await.map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e.to_string()))?;
     let payload = build_message_payload(&req.text, &me);
     let resp = state.teams.send_message(&chat.id, &payload).await
         .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e.to_string()))?;
@@ -584,5 +672,84 @@ mod multiline_tests {
         assert_eq!(html_to_teams("<b>a</b>\n&b"), "&lt;b&gt;a&lt;/b&gt;<br>&amp;b");
         assert_eq!(html_to_teams("plain"), "plain");
         assert_eq!(html_to_teams("a\nb\nc"), "a<br>b<br>c");
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    fn chat(id: &str, title: Option<&str>, one_on_one: bool, members: Vec<(&str, &str)>) -> ChatRecord {
+        ChatRecord {
+            id: id.into(),
+            title: title.map(String::from),
+            is_one_on_one: one_on_one,
+            members: members
+                .iter()
+                .map(|(mri, oid)| ChatMemberRec {
+                    mri: mri.to_string(),
+                    object_id: Some(oid.to_string()),
+                    role: None,
+                    display_name: None,
+                })
+                .collect(),
+            last_message_time: None,
+        }
+    }
+
+    #[test]
+    fn test_normalize_contact_id() {
+        let n = normalize_contact_id("8:orgid:57BC4823-FFEB-4E3B-A0D2-ED5453B44A92").unwrap();
+        assert_eq!(n.mri, "8:orgid:57bc4823-ffeb-4e3b-a0d2-ed5453b44a92");
+        assert_eq!(n.oid, "57bc4823-ffeb-4e3b-a0d2-ed5453b44a92");
+        let n2 = normalize_contact_id("57bc4823-ffeb-4e3b-a0d2-ed5453b44a92").unwrap();
+        assert_eq!(n2.mri, "8:orgid:57bc4823-ffeb-4e3b-a0d2-ed5453b44a92");
+        assert!(normalize_contact_id("8:orgid:").is_none());
+        assert!(normalize_contact_id("").is_none());
+        assert!(normalize_contact_id("8:orgid:ab").is_none());
+        assert!(normalize_contact_id("not-an-id").is_none());
+    }
+
+    #[test]
+    fn test_find_one_on_one_exact_only() {
+        let dir = DirCache {
+            teams: vec![],
+            chats: vec![chat(
+                "19:thread1",
+                None,
+                true,
+                vec![("8:orgid:11111111-aaaa", "11111111-aaaa"), ("8:orgid:22222222-bbbb", "22222222-bbbb")],
+            )],
+        };
+        assert!(find_one_on_one(&dir, "8:orgid:22222222-bbbb").is_some());
+        assert!(find_one_on_one(&dir, "22222222-bbbb").is_some());
+        // Suffix/partial identifiers that previously matched must now fail.
+        assert!(find_one_on_one(&dir, "8:orgid:22").is_none());
+        assert!(find_one_on_one(&dir, "bbbb").is_none());
+        assert!(find_one_on_one(&dir, "22222222-bbbb@evil").is_none());
+    }
+
+    #[test]
+    fn test_allowlist_resolution() {
+        let dir = DirCache {
+            teams: vec![],
+            chats: vec![
+                chat("19:dup1", Some("Dup Name"), false, vec![]),
+                chat("19:dup2", Some("Dup Name"), false, vec![]),
+                chat("19:unique", Some("Unique Group"), false, vec![]),
+            ],
+        };
+        // Thread ids pass through verbatim (case preserved).
+        let ids = resolve_allowlist_ids(&["19:AbC@thread.v2".into()], &dir);
+        assert!(ids.contains("19:AbC@thread.v2"));
+        // Unique name resolves.
+        let ids = resolve_allowlist_ids(&["unique group".into()], &dir);
+        assert_eq!(ids, HashSet::from(["19:unique".to_string()]));
+        // Ambiguous name fails closed (no ids granted).
+        let ids = resolve_allowlist_ids(&["dup name".into()], &dir);
+        assert!(ids.is_empty());
+        // Unknown name fails closed.
+        let ids = resolve_allowlist_ids(&["missing group".into()], &dir);
+        assert!(ids.is_empty());
     }
 }

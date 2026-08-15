@@ -15,7 +15,9 @@ pub struct Config {
     pub bind: String,
     /// Allowed API tokens (client credentials for the REST API).
     pub api_tokens: Vec<String>,
-    /// Group display names that may receive messages via this server.
+    /// Groups that may receive messages: either immutable thread ids ("19:...")
+    /// or exact display names (resolved once at startup to a unique thread id;
+    /// ambiguous or missing names fail closed).
     pub allowed_groups: Vec<String>,
     /// Where the Teams refresh token lives / is persisted.
     pub token_store: PathBuf,
@@ -38,7 +40,7 @@ impl Config {
         let allowed_groups: Vec<String> = std::env::var("SQUADS_ALLOWED_GROUPS")
             .unwrap_or_else(|_| "low latency engine devops".into())
             .split(',')
-            .map(|s| s.trim().to_lowercase().to_string())
+            .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
         let token_store = std::env::var("SQUADS_TOKEN_STORE")

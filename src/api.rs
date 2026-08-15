@@ -4,6 +4,7 @@ use bytes::Bytes;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, LOCATION};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
+use crate::security;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1412,6 +1413,19 @@ pub async fn authorize_image(
         println!("Log: GET {}", url);
     }
 
+    // Security: bind the Skype credential to an exact Microsoft media origin and
+    // never attach it to a message-selected or private destination.
+    if !security::is_allowed_ams_image_url(url) {
+        return Err("refusing to authorize image: non-Microsoft or unsafe URL".into());
+    }
+    if let Ok(parsed) = url::Url::parse(url) {
+        if let Some(host) = parsed.host_str() {
+            if security::host_is_local_or_private(host) {
+                return Err("refusing to authorize image: private/loopback destination".into());
+            }
+        }
+    }
+
     let access_token = format!("skype_token {}", token.value);
 
     let mut headers = HeaderMap::new();
@@ -1422,12 +1436,23 @@ pub async fn authorize_image(
 
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    let res = client.get(url).headers(headers).send().await?;
+    let mut res = client.get(url).headers(headers).send().await?;
 
     if res.status().is_success() {
-        let bytes = res.bytes().await?;
+        if let Some(len) = res.content_length() {
+            if len > security::MAX_MEDIA_BYTES as u64 {
+                return Err("media response exceeds size limit".into());
+            }
+        }
+        let bytes = security::read_limited(&mut res, security::MAX_MEDIA_BYTES)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        if !security::is_jpeg(&bytes) {
+            return Err("media response is not a JPEG image".into());
+        }
         Ok(bytes)
     } else {
         let error_message = format!(
