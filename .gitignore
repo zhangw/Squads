@@ -23,3 +23,8 @@ result
 app.json
 image-cache/*.jpeg
 user-data-dir/
+
+# Codex security scanner artifacts (not part of this Rust project)
+/package.json
+/package-lock.json
+node_modules/
